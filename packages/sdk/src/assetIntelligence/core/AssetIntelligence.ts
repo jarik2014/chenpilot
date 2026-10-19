@@ -37,6 +37,37 @@ export class AssetIntelligence {
   private versionCompatibility: VersionCompatibility;
   private metadataRevisions: MetadataRevisionStore;
   private config: AssetIntelligenceConfig;
+  /**
+   * In-flight provider work, keyed by asset + operation (#1041).
+   *
+   * A cache miss followed by a provider call is a stampede: N concurrent callers
+   * for the same asset each start their own metadata/trust/compatibility fetch.
+   * Coalescing them means one call per (asset, operation) and one cache write.
+   */
+  private readonly inFlight = new Map<string, Promise<unknown>>();
+
+  /** Stable key for the in-flight map: the full asset identity plus the operation. */
+  private operationKey(asset: Asset, operation: string): string {
+    return `${asset.network}:${asset.code}:${asset.issuer ?? 'native'}:${operation}`;
+  }
+
+  /**
+   * Runs `task` once per key while it is in flight and shares its outcome with
+   * every concurrent caller. The entry is removed in `finally`, so a failure is
+   * not cached — the next caller starts a fresh attempt.
+   */
+  private coalesce<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const existing = this.inFlight.get(key) as Promise<T> | undefined;
+    if (existing) {
+      return existing;
+    }
+
+    const started = task().finally(() => {
+      this.inFlight.delete(key);
+    });
+    this.inFlight.set(key, started);
+    return started;
+  }
 
   constructor(config: AssetIntelligenceConfig) {
     this.config = config;
@@ -91,6 +122,31 @@ export class AssetIntelligence {
         return cached;
       }
 
+      // Coalesce concurrent misses for the same asset (#1041): one provider
+      // round-trip and one cache write, no matter how many callers race here.
+      return await this.coalesce(this.operationKey(asset, 'general'), async () => {
+        // Another caller may have filled the cache while this one was queued.
+        const raced = await this.cache.get(asset, 'general');
+        if (raced) {
+          return raced;
+        }
+
+        const assetData = await this.buildAssetInfo(asset);
+        await this.cache.set(asset, 'general', assetData);
+        return assetData;
+      });
+    } catch (error) {
+      throw new AssetIntelligenceError(
+        'PROVIDER_ERROR',
+        `Failed to get asset info: ${error instanceof Error ? error.message : String(error)}`,
+        asset
+      );
+    }
+  }
+
+  /** Builds the full asset record from providers; called once per coalesced miss. */
+  private async buildAssetInfo(asset: Asset): Promise<AssetData> {
+    {
       // Fetch metadata
       const metadata = await this.fetchMetadata(asset);
 
@@ -115,16 +171,7 @@ export class AssetIntelligence {
         lastUpdated: Date.now(),
       };
 
-      // Cache the result
-      await this.cache.set(asset, 'general', assetData);
-
       return assetData;
-    } catch (error) {
-      throw new AssetIntelligenceError(
-        'PROVIDER_ERROR',
-        `Failed to get asset info: ${error instanceof Error ? error.message : String(error)}`,
-        asset
-      );
     }
   }
 
@@ -138,6 +185,13 @@ export class AssetIntelligence {
       if (cached && cached.price) {
         return cached.price;
       }
+
+      // Coalesce concurrent price lookups for this asset (#1041).
+      return await this.coalesce(this.operationKey(asset, 'price'), async () => {
+        const raced = await this.cache.get(asset, 'price');
+        if (raced && raced.price) {
+          return raced.price;
+        }
 
       // TODO: Implement actual price fetching from configured sources
       const priceInfo: PriceInfo = {
@@ -156,6 +210,7 @@ export class AssetIntelligence {
       await this.cache.set(asset, 'price', assetData);
 
       return priceInfo;
+      });
     } catch (error) {
       throw new AssetIntelligenceError(
         'PRICE_UNAVAILABLE',
@@ -176,17 +231,23 @@ export class AssetIntelligence {
         return cached.trust;
       }
 
-      // Calculate trust score
-      const trustScore = await this.trustScorer.calculateTrustScore(asset);
+      // Coalesce concurrent trust lookups for this asset (#1041).
+      return await this.coalesce(this.operationKey(asset, 'trust'), async () => {
+        const raced = await this.cache.get(asset, 'trust');
+        if (raced && raced.trust) {
+          return raced.trust;
+        }
 
-      // Cache the result
-      const assetData: AssetData = {
-        trust: trustScore,
-        lastUpdated: Date.now(),
-      };
-      await this.cache.set(asset, 'trust', assetData);
+        const trustScore = await this.trustScorer.calculateTrustScore(asset);
 
-      return trustScore;
+        const assetData: AssetData = {
+          trust: trustScore,
+          lastUpdated: Date.now(),
+        };
+        await this.cache.set(asset, 'trust', assetData);
+
+        return trustScore;
+      });
     } catch (error) {
       throw new AssetIntelligenceError(
         'TRUST_CHECK_FAILED',
