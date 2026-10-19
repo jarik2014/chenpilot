@@ -75,24 +75,36 @@ export class NetworkCompatibility {
     const reasons: string[] = [];
     const warnings: string[] = [];
 
-    // Check if asset network matches context network
+    // ── Blocking checks ─────────────────────────────────────────────────────
+    // These make the asset unusable for the requested operation, so they belong
+    // in `reasons`.
     if (asset.network !== context.network) {
       reasons.push(`Asset network ${asset.network} does not match context network ${context.network}`);
     }
 
-    // Check if operation is allowed
     if (context.operation && !rule.allowedOperations.includes(context.operation)) {
       reasons.push(`Operation ${context.operation} not allowed on network ${context.network}`);
     }
 
-    // Check if issuer is blocked
     if (asset.issuer && rule.blockedIssuers.includes(asset.issuer)) {
       reasons.push(`Issuer ${asset.issuer} is blocked on network ${context.network}`);
+    }
+
+    // ── Advisory checks (#1039) ─────────────────────────────────────────────
+    // Diagnostics that a caller may want to surface but that do not make the
+    // asset incompatible. Before this split, every signal was pushed into
+    // `reasons` and `warnings` stayed permanently empty, so a caller could not
+    // tell an advisory from a hard failure.
+    if (!asset.issuer) {
+      warnings.push('Asset has no issuer; treating it as a native asset');
+    } else if (asset.code.length > 12) {
+      warnings.push(`Asset code "${asset.code}" is longer than the 12-character convention`);
     }
 
     // Check required features (would need metadata)
     // TODO: Implement feature checking when metadata is available
 
+    // Only blocking reasons decide compatibility; warnings are diagnostics.
     const compatible = reasons.length === 0;
 
     return {
