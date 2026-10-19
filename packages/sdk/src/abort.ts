@@ -24,6 +24,8 @@ export function isAbortError(error: unknown): boolean {
   }
 
   const name = (error as { name?: unknown }).name;
+  // Normalise both shapes callers actually receive: the DOM `DOMException`
+  // (name === "AbortError", not an Error instance) and Node/SDK errors.
   if (name === "AbortError") return true;
 
   // Axios cancellation (used by stellar-sdk's Horizon client).
@@ -228,7 +230,13 @@ export function abortableWait<T>(
   signal?: AbortSignalLike,
   options: AbortableWaitOptions = {}
 ): Promise<T> {
-  if (!signal) return promise;
+  if (!signal) {
+    // Even without a caller signal the shape must be consistent: an I/O layer
+    // that cancels itself can still reject with the platform DOMException.
+    return promise.catch((error: unknown) => {
+      throw isAbortError(error) ? createAbortError(undefined, error) : error;
+    });
+  }
   if (signal.aborted) {
     options.onAbort?.();
     return Promise.reject(createAbortError());
@@ -260,7 +268,10 @@ export function abortableWait<T>(
         if (settled) return;
         settled = true;
         cleanup();
-        reject(error);
+        // A fetch that was cancelled under us rejects with the platform's
+        // DOMException, while our own cancel path rejects with an SDK Error.
+        // Callers must see one shape, so both arrive as createAbortError().
+        reject(isAbortError(error) ? createAbortError(undefined, error) : error);
       }
     );
   });
