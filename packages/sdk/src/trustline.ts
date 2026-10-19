@@ -477,6 +477,33 @@ export async function createTrustlineOperation(
   });
 }
 
+/**
+ * Minimal trustline shape needed to decide whether a destination can receive a
+ * payment of `amount`: the current balance, the configured limit, whether the
+ * issuer authorises us, and any buying liabilities already reserved.
+ */
+export interface TrustlineRecord {
+  balance: string;
+  limit: string;
+  authorized: boolean;
+  buyingLiabilities?: string;
+}
+
+export function validateDestinationReceivingCapacity(
+  trustline: TrustlineRecord | null,
+  amount: string
+): boolean {
+  if (!trustline || !trustline.authorized) return false;
+
+  const balanceNum = parseFloat(trustline.balance);
+  const limitNum = parseFloat(trustline.limit);
+  const buyingLiabilitiesNum = parseFloat(trustline.buyingLiabilities || '0');
+  const amountNum = parseFloat(amount);
+
+  const availableCapacity = limitNum - (balanceNum + buyingLiabilitiesNum);
+  return amountNum <= availableCapacity;
+}
+
 export class TrustlineWorkflowBuilder {
   private assets: AssetToTrust[] = [];
   private trustlinesToRemove: TrustlineInfo[] = [];
@@ -670,20 +697,6 @@ export class TrustlineWorkflowBuilder {
       operationCount,
     };
   }
-export function validateDestinationReceivingCapacity(
-  trustline: TrustlineRecord | null,
-  amount: string
-): boolean {
-  if (!trustline || !trustline.authorized) return false;
-
-  const balanceNum = parseFloat(trustline.balance);
-  const limitNum = parseFloat(trustline.limit);
-  const buyingLiabilitiesNum = parseFloat(trustline.buyingLiabilities || '0');
-  const amountNum = parseFloat(amount);
-
-  const availableCapacity = limitNum - (balanceNum + buyingLiabilitiesNum);
-  return amountNum <= availableCapacity;
-}
   async build(): Promise<TrustlineWorkflowResult> {
     const preview = await this.preview();
     const estimate = this.estimate(preview);
